@@ -1695,6 +1695,13 @@ def run_conversation(
         _defer_preflight = getattr(
             _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
         )
+        _preflight_deferred = False
+        if (
+            agent.compression_enabled
+            and len(messages) > 1
+            and compression_attempts < max_compression_attempts
+        ):
+            _preflight_deferred = bool(_defer_preflight(request_pressure_tokens))
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
@@ -1703,7 +1710,7 @@ def run_conversation(
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
-            and not _defer_preflight(request_pressure_tokens)
+            and not _preflight_deferred
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
         ):
@@ -1805,7 +1812,7 @@ def run_conversation(
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
-            and not _defer_preflight(request_pressure_tokens)
+            and not _preflight_deferred
             and _compression_cooldown
         ):
             # Blocked by the summary-LLM cooldown. Surface a deduped warning
@@ -1827,7 +1834,68 @@ def run_conversation(
                     request_pressure_tokens,
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
-        
+
+        # Hard local admission boundary: after preflight had its chance to
+        # compact, never send a request Hermes still estimates at or above its
+        # configured context window.  The provider remains authoritative for
+        # tokenization, but sending a request already known to violate our own
+        # limit can only produce a deterministic context-length failure.  This
+        # also covers exhausted/no-progress compaction, cooldowns, disabled
+        # compression, and temporary lock deferrals without replaying the same
+        # oversized payload through the provider retry loop.
+        _configured_context_limit = int(
+            getattr(_compressor, "context_length", 0) or 0
+        )
+        # A recent authoritative provider usage sample may deliberately defer
+        # a noisy rough estimate for one pass.  Preserve that anti-thrash path
+        # only while another compression attempt is still available; exhausted,
+        # blocked, cooldown, disabled, and uncompressible cases remain fail-closed.
+        _allow_deferred_over_limit_request = (
+            agent.compression_enabled
+            and len(messages) > 1
+            and compression_attempts < max_compression_attempts
+            and not _preflight_compression_blocked
+            and not _compression_cooldown
+            and _preflight_deferred
+        )
+        if (
+            _configured_context_limit > 0
+            and request_pressure_tokens >= _configured_context_limit
+            and not _allow_deferred_over_limit_request
+        ):
+            agent._flush_status_buffer()
+            logger.error(
+                "%sPre-API context admission blocked: estimated request "
+                "tokens=%s >= configured context=%s (compression_attempts=%s/%s)",
+                agent.log_prefix,
+                f"{request_pressure_tokens:,}",
+                f"{_configured_context_limit:,}",
+                compression_attempts,
+                max_compression_attempts,
+            )
+            agent._persist_session(messages, conversation_history)
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            agent.iteration_budget.refund()
+            _final_response = (
+                "Context safety limit reached before provider call: estimated "
+                f"request size ({request_pressure_tokens:,} tokens) is at or "
+                "above the configured context window "
+                f"({_configured_context_limit:,} tokens), and compression did "
+                "not reduce it below that boundary. Try /compress or /new."
+            )
+            return {
+                "final_response": _final_response,
+                "messages": messages,
+                "completed": False,
+                "api_calls": api_call_count,
+                "error": _final_response,
+                "partial": True,
+                "failed": True,
+                "compression_exhausted": True,
+                "provider_call_blocked": True,
+            }
+
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
         
