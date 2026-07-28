@@ -80,6 +80,15 @@ class TestSummarizeToolResultWebExtract:
         assert summary == "[web_extract] https://example.com/a (+1 more) (500 chars)"
 
 
+class TestCompressionProgressSignal:
+    def test_default_is_false_and_constructor_initialization_continues(self, compressor):
+        """The progress hook must not split ``__init__`` or skip later state."""
+        assert compressor.compression_made_progress() is False
+        assert compressor._cooldown_persist_failed is False
+        assert compressor._last_summary_error is None
+        assert compressor._last_compress_aborted is False
+
+
 class TestShouldCompress:
     def test_below_threshold(self, compressor):
         compressor.last_prompt_tokens = 50000
