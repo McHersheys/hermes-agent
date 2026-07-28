@@ -8,6 +8,7 @@ consecutive-failure cap.
 Tests verify:
 - Identity preflight loop stops at ``max_compression_attempts``
 - Effective compressions reset the streak after a successful model response
+- Requests still at/above the configured window fail closed before provider I/O
 """
 
 from __future__ import annotations
@@ -149,6 +150,106 @@ class TestConsecutiveFailureCompressionCap:
             f"got {len(compress_calls)}"
         )
         assert result.get("completed") is True
+
+    def test_preflight_blocks_uncompressible_request_at_configured_context(
+        self, agent
+    ):
+        """An over-limit request must fail locally instead of reaching the provider."""
+        agent.context_compressor.context_length = 100_000
+        agent.context_compressor.last_prompt_tokens = 150_000
+
+        with (
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=150_000,
+            ),
+            patch.object(agent, "_compress_context") as compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do work")
+
+        compress.assert_not_called()
+        assert result["completed"] is False
+        assert result["compression_exhausted"] is True
+        assert result["provider_call_blocked"] is True
+        assert result["api_calls"] == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_preflight_preserves_authoritative_usage_defer_with_budget(self, agent):
+        """A one-pass real-usage defer remains available while compression can retry."""
+        agent.context_compressor.context_length = 100_000
+        agent.context_compressor.last_prompt_tokens = 50_000
+        agent.context_compressor.should_defer_preflight_to_real_usage.return_value = True
+        history = [
+            {"role": "user", "content": "earlier request"},
+            {"role": "assistant", "content": "earlier response"},
+        ]
+
+        with (
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=150_000,
+            ),
+            patch.object(agent, "_compress_context") as compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.client.chat.completions.create.side_effect = [_stop_response()]
+            result = agent.run_conversation(
+                "do work",
+                conversation_history=history,
+            )
+
+        compress.assert_not_called()
+        assert result["completed"] is True
+        assert agent.client.chat.completions.create.call_count == 1
+
+    def test_preflight_blocks_after_no_progress_attempt_budget_is_exhausted(
+        self, agent
+    ):
+        """Exhausted ineffective compaction must not fall through to the provider."""
+        agent.context_compressor.context_length = 100_000
+        agent.context_compressor.last_prompt_tokens = 150_000
+        agent.context_compressor.compression_made_progress.return_value = False
+        agent.max_compression_attempts = 1
+        compress_calls = []
+
+        def _fake_compress(messages, system_message, **_kwargs):
+            compress_calls.append(len(messages))
+            return messages, "compressed prompt"
+
+        history = [
+            {"role": "user", "content": "earlier request"},
+            {"role": "assistant", "content": "earlier response"},
+        ]
+        with (
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=150_000,
+            ),
+            patch(
+                "agent.conversation_loop._compression_warrants_another_preflight_pass",
+                return_value=True,
+            ),
+            patch.object(agent, "_compress_context", side_effect=_fake_compress),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "do work",
+                conversation_history=history,
+            )
+
+        assert len(compress_calls) == 1
+        assert result["completed"] is False
+        assert result["compression_exhausted"] is True
+        assert result["provider_call_blocked"] is True
+        assert result["api_calls"] == 0
+        agent.client.chat.completions.create.assert_not_called()
 
     def test_effective_compression_resets_streak_on_success(self, agent):
         """Effective compression + successful model response → streak reset.
